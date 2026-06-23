@@ -27,6 +27,7 @@ Smoke test (no display needed; auto-quits):
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import threading
@@ -48,6 +49,143 @@ from store import Store, reset_db
 
 UP_COLOR = "#26a69a"
 DN_COLOR = "#ef5350"
+
+# Admissible candlestick widths (seconds), ascending. The pop-out window picks
+# one of these based on the visible time span (see choose_bar_seconds).
+ADMISSIBLE_BAR_SECONDS: list[int] = [1, 10, 20, 30, 60, 300, 600, 3600, 86400]
+# Below this visible span (seconds) the pop-out always shows 1s candles.
+SMALL_WINDOW_THRESHOLD: float = 100.0
+# Above SMALL_WINDOW_THRESHOLD, the widest admissible width is chosen such that
+# the window still spans at least this many candles.
+MIN_BARS_IN_VIEW: int = 30
+
+
+def choose_bar_seconds(window_span: float) -> int:
+    """Pick the candlestick width (seconds) for a visible window span.
+
+    Spans <= 100s use 1s candles. Otherwise the largest admissible width that
+    still yields at least MIN_BARS_IN_VIEW candles across the window is chosen.
+    """
+    if window_span <= SMALL_WINDOW_THRESHOLD:
+        return 1
+    cap = window_span / MIN_BARS_IN_VIEW
+    chosen = 1
+    for s in ADMISSIBLE_BAR_SECONDS:
+        if s <= cap:
+            chosen = s
+        else:
+            break
+    return chosen
+
+
+def _fmt_bar_seconds(s: int) -> str:
+    """Human-readable width for the pop-out readout (1s, 10s, 1m, 5m, 1h, 1d)."""
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        m, r = divmod(s, 60)
+        return f"{m}m" if r == 0 else f"{m}m{r}s"
+    if s < 86400:
+        h, r = divmod(s, 3600)
+        return f"{h}h" if r == 0 else f"{h}h{r // 60}m"
+    return f"{s // 86400}d"
+
+
+DAY_SECONDS = 86400
+
+
+class TimeAxisItem(pg.AxisItem):
+    """Bottom x-axis whose tick spacing is a multiple of the candlestick width.
+
+    Ticks therefore land on bar boundaries and the spacing coarsens with the
+    bar width. Labels are time-of-day (HH:MM:SS / HH:MM) for sub-day bars and
+    dates (%Y-%m-%d) for 1-day bars.
+    """
+
+    def __init__(self, orientation="bottom", **kw) -> None:
+        super().__init__(orientation, **kw)
+        self.bar_seconds = 1
+
+    def set_bar_seconds(self, s: int) -> None:
+        self.bar_seconds = max(int(s), 1)
+
+    def tickValues(self, minVal, maxVal, size):
+        b = self.bar_seconds
+        span = maxVal - minVal
+        if span <= 0 or size <= 0:
+            return [(float(b), [])]
+        # ~8 ticks, but never denser than one label per ~60 px.
+        ideal = max(span / 8.0, span * 60.0 / size)
+        step = float(b)
+        for m in (1, 2, 3, 5, 6, 10, 15, 30, 60, 120, 300, 600,
+                  1800, 3600, 7200, 14400, 43200, 86400):
+            cand = float(b) * m
+            if cand >= ideal:
+                step = cand
+                break
+        start = math.floor(minVal / step) * step + step
+        ticks = []
+        t = start
+        while t <= maxVal + 1e-6:
+            ticks.append(float(t))
+            t += step
+        return [(step, ticks)]
+
+    def tickStrings(self, values, scale, spacing):
+        b = self.bar_seconds
+        if b >= DAY_SECONDS:
+            fmt = "%Y-%m-%d"
+        elif spacing < 60:
+            fmt = "%H:%M:%S"
+        else:
+            fmt = "%H:%M"
+        out = []
+        for v in values:
+            try:
+                out.append(datetime.fromtimestamp(v, tz=timezone.utc).strftime(fmt))
+            except (OSError, ValueError, OverflowError):
+                out.append("")
+        return out
+
+
+class DayAxisItem(pg.AxisItem):
+    """Top x-axis that divides the visible range into days.
+
+    Ticks land on UTC midnights (multiples of DAY_SECONDS). Shown only for
+    sub-day candlestick widths; for a single-day window no tick falls inside
+    the view, so the owning Popout sets a date label instead.
+    """
+
+    def __init__(self, orientation="top", **kw) -> None:
+        super().__init__(orientation, **kw)
+
+    def tickValues(self, minVal, maxVal, size):
+        span = maxVal - minVal
+        if span <= 0 or size <= 0:
+            return [(float(DAY_SECONDS), [])]
+        ideal = max(span / 8.0, span * 60.0 / size)
+        step = float(DAY_SECONDS)
+        for m in (1, 2, 3, 5, 7, 14, 30, 60, 90, 180, 365):
+            cand = DAY_SECONDS * m
+            if cand >= ideal:
+                step = float(cand)
+                break
+        start = math.floor(minVal / step) * step + step
+        ticks = []
+        t = start
+        while t <= maxVal + 1e-6:
+            ticks.append(float(t))
+            t += step
+        return [(step, ticks)]
+
+    def tickStrings(self, values, scale, spacing):
+        out = []
+        for v in values:
+            try:
+                out.append(datetime.fromtimestamp(v, tz=timezone.utc).strftime("%Y-%m-%d"))
+            except (OSError, ValueError, OverflowError):
+                out.append("")
+        return out
 
 
 @dataclass(slots=True)
@@ -89,6 +227,31 @@ class DbSource:
             self._has_data[sym] = True
         return [Bar(b.t, b.o, b.h, b.l, b.c) for b in stored]
 
+    def get_bars_at(self, sym: str, interval_s: int, limit: int) -> list[Bar]:
+        """Return up to `limit` recent bars for `sym` at an arbitrary interval.
+
+        Used by the pop-out window, whose candlestick width adapts to the zoom
+        level and therefore needs to fetch bars at a view-chosen interval
+        rather than the fixed display interval.
+        """
+        stored = self._store.get_bars(sym, interval_s, limit)
+        if not self._has_data[sym] and stored:
+            self._has_data[sym] = True
+        return [Bar(b.t, b.o, b.h, b.l, b.c) for b in stored]
+
+    def get_bars_range(self, sym: str, interval_s: int,
+                       t_start: float, t_end: float) -> list[Bar]:
+        """Return bars for `sym` at `interval_s` overlapping [t_start, t_end].
+
+        Used by the pop-out window to fetch exactly the bars visible in the
+        current view rect (which may be panned away from the most recent data),
+        rather than the N most recent bars.
+        """
+        stored = self._store.get_bars_range(sym, interval_s, t_start, t_end)
+        if stored and not self._has_data[sym]:
+            self._has_data[sym] = True
+        return [Bar(b.t, b.o, b.h, b.l, b.c) for b in stored]
+
     def status(self) -> str:
         if not any(self._has_data.values()):
             return f"db: {self._db_path} (no data yet)"
@@ -117,13 +280,15 @@ class CandlestickItem(pg.GraphicsObject):
         self._dn_pen = pg.mkPen(DN_COLOR)
         self._dn_brush = pg.mkBrush(DN_COLOR)
 
-    def setData(self, t, o, h, l, c) -> None:
+    def setData(self, t, o, h, l, c, bar_seconds=None) -> None:
         self._t = np.asarray(t, dtype=float)
         self._o = np.asarray(o, dtype=float)
         self._h = np.asarray(h, dtype=float)
         self._l = np.asarray(l, dtype=float)
         self._c = np.asarray(c, dtype=float)
-        if len(self._t) > 1:
+        if bar_seconds is not None:
+            self._w = bar_seconds / 3.0
+        elif len(self._t) > 1:
             self._w = (self._t[1] - self._t[0]) / 3.0
         self.prepareGeometryChange()
         self.update()
@@ -138,10 +303,11 @@ class CandlestickItem(pg.GraphicsObject):
         dh = float(self._h.max() - self._l.min())
         if dh == 0:
             dh = 1e-6
+        w = self._w
         return QtCore.QRectF(
-            float(self._t.min()) - 1,
+            float(self._t.min()) - w - 1,
             float(self._l.min()),
-            float(self._t.max() - self._t.min()) + 2,
+            float(self._t.max() - self._t.min()) + 2 * w + 2,
             dh,
         )
 
@@ -176,22 +342,40 @@ class Popout(QtWidgets.QWidget):
     """Dedicated, interactive window for one pair: zoom/drag/scroll enabled.
 
     The datetime axis (UTC) reformats automatically as you zoom in/out.
+
+    Zoom-driven candlestick width: the bar interval is chosen from the visible
+    time span -- 1s for windows <= 100s, otherwise the widest admissible width
+    (see ADMISSIBLE_BAR_SECONDS) that still shows at least MIN_BARS_IN_VIEW
+    candles. Candles are centred on the midpoint of the period they cover. The
+    active width is shown in the top-right corner.
     """
 
     def __init__(self, name: str, source: DbSource, bar_seconds: int,
-                 on_close) -> None:
+                 window: int, on_close) -> None:
         super().__init__()
         self.name = name
         self.source = source
-        self.bar_seconds = bar_seconds
+        self.bar_seconds = bar_seconds        # default interval (seeds initial view)
+        self._window = window                 # default bar count (seeds initial view)
         self._on_close = on_close
+        # Currently applied candlestick width; updated as the view span changes.
+        self._bar_seconds = bar_seconds
+        self._fitted = False                  # one-shot initial view seeding
+        self._y_set = False                   # one-shot initial Y fit
+        self._in_refresh = False              # reentrancy guard
         self.setWindowTitle(f"FX Monitor — {name}")
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
-        # UTC datetime axis: shows "2026-01-01 00:00:00" at the sim start
-        # regardless of the host's local timezone.
-        axis = DateAxisItem(orientation="bottom", utcOffset=0)
-        self.plot = pg.PlotWidget(title=name, axisItems={"bottom": axis})
+        # Two-tier x-axis: bottom shows time-of-day (or dates for 1d bars) with
+        # tick spacing matched to the candlestick width; top divides the range
+        # into days when the bars are sub-day.
+        self._time_axis = TimeAxisItem(orientation="bottom")
+        self._time_axis.set_bar_seconds(bar_seconds)
+        self._day_axis = DayAxisItem(orientation="top")
+        self.plot = pg.PlotWidget(
+            title=name,
+            axisItems={"bottom": self._time_axis, "top": self._day_axis},
+        )
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("left", "price")
         self.plot.setLabel("bottom", "time (UTC)")
@@ -199,6 +383,9 @@ class Popout(QtWidgets.QWidget):
         # right-click menu (view all / export / axis options).
         self.plot.setMouseEnabled(x=True, y=True)
         self.plot.setMenuEnabled(True)
+        # We manage the view range ourselves (initial fit + span-driven width),
+        # so disable auto-range: item-bound changes must not override user zoom.
+        self.plot.enableAutoRange(x=False, y=False)
         p = self.plot.getPlotItem()
         p.getAxis("left").setWidth(60)
         layout.addWidget(self.plot)
@@ -210,26 +397,131 @@ class Popout(QtWidgets.QWidget):
         p.addItem(self.line)
         self.label = pg.TextItem(anchor=(0, 0.5), color="#e6e8ee")
         p.addItem(self.label)
+        # Candlestick-width readout, pinned to the top-right of the viewport.
+        self.width_label = pg.TextItem(anchor=(1, 0), color="#ffd166")
+        self.width_label.setZValue(50)
+        p.addItem(self.width_label, ignoreBounds=True)
+        self.width_label.setText(_fmt_bar_seconds(self._bar_seconds))
+
+        p.getViewBox().sigXRangeChanged.connect(self._on_x_range_changed)
         self.show()
 
-    def refresh(self) -> None:
-        bars = self.source.get_bars(self.name)
-        if not bars:
+    # ----- view helpers --------------------------------------------------
+
+    def _visible_span(self) -> float:
+        return float(self.plot.getPlotItem().getViewBox().viewRect().width())
+
+    def _pin_width_label(self) -> None:
+        """Anchor the width readout to the top-right of the current viewport."""
+        vr = self.plot.getPlotItem().getViewBox().viewRect()
+        self.width_label.setPos(vr.right(), vr.top())
+
+    def _on_x_range_changed(self, *_args) -> None:
+        # Keep the readout pinned on every pan/zoom (cheap; no fetch).
+        self._pin_width_label()
+        if self._in_refresh:
             return
-        t = np.fromiter((b.t for b in bars), dtype=float)
-        o = np.fromiter((b.o for b in bars), dtype=float)
-        h = np.fromiter((b.h for b in bars), dtype=float)
-        l = np.fromiter((b.l for b in bars), dtype=float)
-        c = np.fromiter((b.c for b in bars), dtype=float)
-        self.candle.setData(t, o, h, l, c)
-        cur_t = bars[-1].t
-        price = float(c[-1])
-        hw = self.candle.body_width()  # 2x candle body width => half-width
-        self.line.setData(x=np.array([cur_t - hw, cur_t + hw]),
-                          y=np.array([price, price]))
-        delta = price - float(o[0])
-        self.label.setText(f"{price:.5f}   Δ{delta:+.5f}")
-        self.label.setPos(cur_t + hw, price)
+        # Refresh immediately on any pan/zoom: refresh now fetches by visible
+        # range, so a pan into a new region must reload candles there rather than
+        # waiting for the periodic timer (avoids missing-candle flicker).
+        self.refresh()
+
+    # ----- data update ---------------------------------------------------
+
+    def refresh(self) -> None:
+        if self._in_refresh:
+            return
+        self._in_refresh = True
+        try:
+            p = self.plot.getPlotItem()
+            if not self._fitted:
+                # One-shot: seed the initial view to the default window span so
+                # the first span-driven width selection is meaningful (not the
+                # [0, 1] default range). The right edge is anchored to the last
+                # bar's period-right-edge at the chosen interval so the most
+                # recent candle has spacing (matching the base display, which
+                # ends the view at cur_t + interval).
+                seed_span = max(self._window * self.bar_seconds, 1)
+                seed_interval = choose_bar_seconds(seed_span)
+                probe = self.source.get_bars_at(self.name, seed_interval, 4)
+                if not probe:
+                    self.width_label.setText(_fmt_bar_seconds(seed_interval))
+                    self._pin_width_label()
+                    return
+                right = float(probe[-1].t) + seed_interval
+                p.setXRange(right - seed_span, right + seed_interval * 10, padding=0)
+                self._fitted = True
+                # setXRange fires sigXRangeChanged; the reentrancy guard makes
+                # the recursive _on_x_range_changed a no-op for the fetch.
+
+            span = self._visible_span()
+            interval = choose_bar_seconds(span)
+            self._bar_seconds = interval
+            self.width_label.setText(_fmt_bar_seconds(interval))
+            # Drive the two-tier axis: bottom tick spacing matches the bar
+            # width; top day axis (with dividing ticks / date label) is shown
+            # only for sub-day bar widths.
+            self._time_axis.set_bar_seconds(interval)
+            self._time_axis.setLabel("date (UTC)" if interval >= DAY_SECONDS
+                                     else "time (UTC)")
+            self._time_axis.update()
+            vr = p.getViewBox().viewRect()
+            if interval < DAY_SECONDS:
+                p.showAxis("top", True)
+                multi_day = (math.floor(vr.left() / DAY_SECONDS)
+                             != math.floor(vr.right() / DAY_SECONDS))
+                if multi_day:
+                    self._day_axis.setLabel("")
+                else:
+                    day0 = math.floor(vr.left() / DAY_SECONDS) * DAY_SECONDS
+                    self._day_axis.setLabel(
+                        datetime.fromtimestamp(day0, tz=timezone.utc).strftime("%Y-%m-%d")
+                    )
+            else:
+                p.showAxis("top", False)
+            # Fetch exactly the bars overlapping the visible view rect (not the
+            # N most recent): panning/zooming into an older region, or the
+            # latest bars scrolling past a fixed view, must not starve the plot.
+            vr = p.getViewBox().viewRect()
+            bars = self.source.get_bars_range(
+                self.name, interval, vr.left(), vr.right(),
+            )
+            if not bars:
+                self.candle.setData(np.empty(0), np.empty(0), np.empty(0),
+                                     np.empty(0), np.empty(0),
+                                     bar_seconds=interval)
+                self._pin_width_label()
+                return
+
+            # Centre each candle on the midpoint of the period it covers
+            # (bar t is the start; the period runs [t, t + interval)).
+            half = interval / 2.0
+            t0 = np.fromiter((b.t + half for b in bars), dtype=float)
+            o = np.fromiter((b.o for b in bars), dtype=float)
+            h = np.fromiter((b.h for b in bars), dtype=float)
+            l = np.fromiter((b.l for b in bars), dtype=float)
+            c = np.fromiter((b.c for b in bars), dtype=float)
+            self.candle.setData(t0, o, h, l, c, bar_seconds=interval)
+
+            cur_centre = float(bars[-1].t) + half
+            price = float(c[-1])
+            hw = self.candle.body_width()  # 2x candle body width => half-width
+            self.line.setData(x=np.array([cur_centre - hw, cur_centre + hw]),
+                              y=np.array([price, price]))
+            delta = price - float(o[0])
+            self.label.setText(f"{price:.5f}   Δ{delta:+.5f}")
+            self.label.setPos(cur_centre + hw, price)
+
+            if not self._y_set:
+                hi = float(h.max())
+                lo = float(l.min())
+                pad = max((hi - lo) * 0.08, abs(hi) * 1e-5)
+                p.setYRange(lo - pad, hi + pad, padding=0)
+                self._y_set = True
+
+            self._pin_width_label()
+        finally:
+            self._in_refresh = False
 
     def closeEvent(self, ev) -> None:
         try:
@@ -285,6 +577,11 @@ def main() -> None:
     sim_stop: threading.Event | None = None
     if args.simulate:
         writer_store = Store(args.db)
+        if not writer_store.acquire_writer_lock():
+            print(f"[fx] ERROR: another writer is already using {args.db}. "
+                  f"Close the previous instance before starting a new sim.")
+            writer_store.close()
+            raise SystemExit(1)
         sim_stop = threading.Event()
         sim_thread = threading.Thread(
             target=run_sim, args=(pairs, writer_store, sim_stop), daemon=True,
@@ -342,7 +639,7 @@ def main() -> None:
         if name in popouts:
             popouts[name].close()  # closeEvent removes it from the dict
             return
-        popouts[name] = Popout(name, source, args.bar_seconds,
+        popouts[name] = Popout(name, source, args.bar_seconds, args.window,
                                lambda n: popouts.pop(n, None))
 
     def on_scene_clicked(ev) -> None:
@@ -369,18 +666,20 @@ def main() -> None:
                 labels[name].setPos(args.window - 1, 1.0)
                 continue
 
-            t = np.fromiter((b.t for b in bars), dtype=float)
+            t = np.fromiter((b.t + interval / 2.0 for b in bars), dtype=float)
             o = np.fromiter((b.o for b in bars), dtype=float)
             h = np.fromiter((b.h for b in bars), dtype=float)
             l = np.fromiter((b.l for b in bars), dtype=float)
             c = np.fromiter((b.c for b in bars), dtype=float)
-            candles[name].setData(t, o, h, l, c)
+            candles[name].setData(t, o, h, l, c, bar_seconds=interval)
 
             cur_t = float(bars[-1].t)
             latest_t = cur_t if latest_t is None else max(latest_t, cur_t)
-            # Follow the latest bar: keep a fixed-width window of `window` bars.
+            # Follow the latest bar: keep a fixed-width window of `window` bars,
+            # with extra space on the right so the spot-price label isn't clipped.
+            right_pad = interval * 10
             plot.setXRange(cur_t - (args.window - 1) * interval,
-                           cur_t + interval, padding=0)
+                           cur_t + interval + right_pad, padding=0)
 
             hi = float(h.max()); lo = float(l.min())
             pad = max((hi - lo) * 0.08, abs(hi) * 1e-5)
@@ -388,12 +687,13 @@ def main() -> None:
 
             price = float(c[-1])
             hw = candles[name].body_width()  # 2x candle body => half-width
-            lines[name].setData(x=np.array([cur_t - hw, cur_t + hw]),
+            cur_centre = cur_t + interval / 2.0
+            lines[name].setData(x=np.array([cur_centre - hw, cur_centre + hw]),
                                 y=np.array([price, price]))
             lines[name].setVisible(True)
             delta = price - float(o[0])
             labels[name].setText(f"{price:.5f}   Δ{delta:+.5f}")
-            labels[name].setPos(cur_t + hw, price)
+            labels[name].setPos(cur_centre + hw, price)
 
         if latest_t is not None:
             status_lbl.setText(f"{mode}: {args.db}  t={_iso(latest_t)}")
