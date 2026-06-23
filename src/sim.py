@@ -139,10 +139,20 @@ def run_sim(
         now = clock.now()
         if now >= next_tick:
             for p in pairs:
+                old = prices[p.name]
                 prices[p.name] *= 1.0 + rng.gauss(0.0, 0.0004)
                 mid = prices[p.name]
                 tick_buf.append((p.name, int(now * 1000), None, None, mid))
                 builders[p.name].on_price(now, mid)
+                # Guard: log abnormally large relative price moves so we can
+                # trace any future bad-data episode to its exact tick.
+                # sigma=0.0004 -> a 10-sigma move (0.4%) is statistically
+                # impossible and would indicate a real bug.
+                rel = abs(mid / old - 1.0)
+                if rel > 0.004:
+                    print(f"[sim] WARN large move {p.name}: "
+                          f"{old:.5f} -> {mid:.5f} (rel={rel*100:.3f}%) "
+                          f"t={int(now)} ({_iso(now)})")
             next_tick = now + tick_period
         if time.time() - last_flush >= flush_period:
             flush(store, tick_buf, builders)

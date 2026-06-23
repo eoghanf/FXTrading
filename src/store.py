@@ -18,6 +18,9 @@ WAL mode is enabled so the single writer (backend) and concurrent readers
 """
 from __future__ import annotations
 
+import fcntl
+import math
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -102,8 +105,46 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=30000;")
         with self._lock:
             self._conn.executescript(SCHEMA)
+        # Exclusive file lock prevents two writer processes from using the
+        # same DB simultaneously (which would corrupt OHLC bars via the
+        # upsert merge — two random walks writing to the same timestamps
+        # produce artificially wide high/low ranges). Readers don't hold
+        # this lock.
+        self._lock_fd: int | None = None
 
     # ----- writers (backend) --------------------------------------------
+
+    def acquire_writer_lock(self) -> bool:
+        """Try to acquire an exclusive OS-level lock on the database file.
+
+        Returns True if the lock was acquired, False if another process
+        already holds it. The lock is released on close() or process exit.
+        This prevents two sim/ingest backends from writing simultaneously,
+        which would corrupt OHLC bars via the upsert merge (two random
+        walks writing to the same timestamps produce artificially wide
+        high/low ranges).
+        """
+        if self._lock_fd is not None:
+            return True  # already held
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return False
+        self._lock_fd = fd
+        os.write(fd, f"{os.getpid()}\n".encode())
+        return True
+
+    def release_writer_lock(self) -> None:
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     def begin(self) -> None:
         with self._lock:
@@ -196,6 +237,47 @@ class Store:
         ).fetchone()
         return row is not None
 
+    def get_bars_range(
+        self, sym: str, interval_s: int, t_start: float, t_end: float,
+    ) -> list[StoredBar]:
+        """Return bars for `sym` at `interval_s` overlapping [t_start, t_end].
+
+        Bars are returned oldest-first. Unlike get_bars (which returns the most
+        recent N bars), this returns every bar whose period intersects the
+        half-open window [t_start, t_end], so a viewer can fetch exactly the
+        bars visible in a panned/zoomed view rect.
+        """
+        if interval_s < 1:
+            raise ValueError("interval_s must be >= 1 second")
+        if interval_s % BASE_INTERVAL != 0:
+            raise ValueError(
+                f"interval_s must be a whole-second multiple of {BASE_INTERVAL}s"
+            )
+        if t_end < t_start:
+            return []
+
+        # Snap the fetch window outwards to bar boundaries so the bars
+        # straddling t_start and t_end are fully captured.
+        key_lo = int(math.floor(t_start / interval_s) * interval_s)
+        key_hi = int(math.floor(t_end / interval_s) * interval_s) + interval_s
+
+        if interval_s == BASE_INTERVAL:
+            rows = self._conn.execute(
+                "SELECT t, o, h, l, c FROM bars "
+                "WHERE sym=? AND interval_s=? AND t>=? AND t<? "
+                "ORDER BY t",
+                (sym, BASE_INTERVAL, key_lo, key_hi),
+            ).fetchall()
+            return [StoredBar(r["t"], r["o"], r["h"], r["l"], r["c"]) for r in rows]
+
+        rows = self._conn.execute(
+            "SELECT t, o, h, l, c FROM bars "
+            "WHERE sym=? AND interval_s=? AND t>=? AND t<? "
+            "ORDER BY t",
+            (sym, BASE_INTERVAL, key_lo, key_hi),
+        ).fetchall()
+        return _aggregate_range(rows, interval_s)
+
     def max_bar_time(self, syms: list[str], interval_s: int = BASE_INTERVAL) -> int | None:
         """Most recent bar start time across `syms`, or None if no bars exist."""
         if not syms:
@@ -210,6 +292,7 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+        self.release_writer_lock()
 
 
 def _aggregate(rows: list[sqlite3.Row], interval_s: int, limit: int) -> list[StoredBar]:
@@ -233,3 +316,30 @@ def _aggregate(rows: list[sqlite3.Row], interval_s: int, limit: int) -> list[Sto
     if cur_key is not None:
         out.append(StoredBar(cur_key, o, h, l, c))
     return out[-limit:]
+
+
+def _aggregate_range(rows: list[sqlite3.Row], interval_s: int) -> list[StoredBar]:
+    """Group 1-second bars into `interval_s`-second OHLC bars (no limit slice).
+
+    Unlike _aggregate this returns every group present in `rows` (oldest-first),
+    so a viewer can fetch exactly the bars overlapping a given time range.
+    """
+    out: list[StoredBar] = []
+    cur_key: int | None = None
+    o = h = l = c = 0.0
+    for r in rows:
+        key = (r["t"] // interval_s) * interval_s
+        if cur_key is None or key != cur_key:
+            if cur_key is not None:
+                out.append(StoredBar(cur_key, o, h, l, c))
+            cur_key = key
+            o, h, l, c = r["o"], r["h"], r["l"], r["c"]
+        else:
+            if r["h"] > h:
+                h = r["h"]
+            if r["l"] < l:
+                l = r["l"]
+            c = r["c"]
+    if cur_key is not None:
+        out.append(StoredBar(cur_key, o, h, l, c))
+    return out

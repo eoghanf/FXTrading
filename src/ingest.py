@@ -178,6 +178,11 @@ def main() -> None:
         print(f"[ingest] reset {args.db}: {'wiped' if removed else 'already empty'}")
     pairs = parse_pairs(args.pairs) if args.pairs else DEFAULT_PAIRS
     store = Store(args.db)
+    if not store.acquire_writer_lock():
+        print(f"[ingest] ERROR: another writer is already using {args.db}. "
+              f"Close the previous instance before starting.")
+        store.close()
+        raise SystemExit(1)
     stop = threading.Event()
 
     def handle_sig(_signum, _frame) -> None:
