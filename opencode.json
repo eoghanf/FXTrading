@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "togetherai": {
+      "models": {
+        "zai-org/GLM-5.2": {
+          "name": "GLM 5.2",
+          "limit": { "context": 1000000, "output": 131072 }
+        }
+      }
+    }
+  },
+  "model": "togetherai/zai-org/GLM-5.2"
+}
