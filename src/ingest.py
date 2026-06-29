@@ -39,10 +39,28 @@ import sys
 import threading
 import time
 from functools import partial
+from pathlib import Path
 
-from pairs import DEFAULT_PAIRS, Pair, parse_pairs
+import yaml
+
+from pairs import Pair, load_pairs, parse_pairs
 from sim import BarBuilder, flush, run_sim
 from store import Store, reset_db
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "ibkr_connection.yaml"
+
+
+def _load_connection_config() -> dict:
+    """Read ibkr_connection.yaml. Returns {} if missing/invalid."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with CONFIG_PATH.open() as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"[ingest] warning: could not parse {CONFIG_PATH}: {e}",
+              file=sys.stderr)
+        return {}
 
 
 def _finite(x) -> bool:
@@ -90,7 +108,7 @@ def _run_session(args, store: Store, pairs: list[Pair], stop: threading.Event) -
         builders[pair.name].on_price(now, mid)
 
     for p in pairs:
-        contract = Forex(p.base, p.quote)
+        contract = Forex(p.base + p.quote)
         try:
             ticker = ib.reqMktData(contract, "", False, False)
         except Exception as e:  # noqa: BLE001
@@ -143,13 +161,17 @@ def _real_loop(args, store: Store, pairs: list[Pair], stop: threading.Event) -> 
 
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
+    cfg = _load_connection_config()
     ap = argparse.ArgumentParser(description="IBKR FX ingestion backend.")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=7497,
-                    help="TWS/IBG socket port (7497 paper / 7496 live)")
-    ap.add_argument("--client-id", type=int, default=1)
+    ap.add_argument("--host", default=cfg.get("host", "127.0.0.1"))
+    ap.add_argument("--port", type=int,
+                    default=int(cfg.get("port", 7497)),
+                    help="TWS/IBG socket port (default from ibkr_connection.yaml; "
+                         "IBG paper 4002 / live 4001; TWS paper 7497 / live 7496)")
+    ap.add_argument("--client-id", type=int,
+                    default=int(cfg.get("client_id", 1)))
     ap.add_argument("--pairs", default=None,
-                    help="comma list BASE/QUOTE (default: EUR/USD,GBP/USD,USD/TRY,USD/CAD)")
+                    help="comma list BASE/QUOTE (default: read from fx_pairs.yaml)")
     ap.add_argument("--db", default=None,
                     help="SQLite database path (default: fxsim.db if --simulate, else fxreal.db)")
     ap.add_argument("--flush-ms", type=int, default=200,
@@ -176,7 +198,7 @@ def main() -> None:
     if args.reset:
         removed = reset_db(args.db)
         print(f"[ingest] reset {args.db}: {'wiped' if removed else 'already empty'}")
-    pairs = parse_pairs(args.pairs) if args.pairs else DEFAULT_PAIRS
+    pairs = parse_pairs(args.pairs) if args.pairs else load_pairs()
     store = Store(args.db)
     if not store.acquire_writer_lock():
         print(f"[ingest] ERROR: another writer is already using {args.db}. "

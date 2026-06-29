@@ -1,7 +1,17 @@
-"""Shared FX pair definitions used by the ingest backend and the GUI viewer."""
+"""Shared FX pair definitions used by the ingest backend and the GUI viewer.
+
+The pair list is read from fx_pairs.yaml at the project root; DEFAULT_PAIRS
+below is the fallback used only when that file is missing or unparseable.
+"""
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "fx_pairs.yaml"
 
 
 @dataclass(slots=True)
@@ -26,6 +36,31 @@ SEED_PRICES: dict[str, float] = {
     "USD/TRY": 32.50,
     "USD/CAD": 1.3600,
 }
+
+
+def load_pairs() -> list[Pair]:
+    """Read fx_pairs.yaml. Falls back to DEFAULT_PAIRS only if the file is
+    missing or unparseable; an empty `pairs:` list is respected as-is.
+    """
+    if not CONFIG_PATH.exists():
+        return list(DEFAULT_PAIRS)
+    try:
+        with CONFIG_PATH.open() as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"[pairs] warning: could not parse {CONFIG_PATH}: {e}",
+              file=sys.stderr)
+        return list(DEFAULT_PAIRS)
+    items = data.get("pairs") or []
+    return [
+        Pair(
+            name=it["name"],
+            base=it["base"],
+            quote=it["quote"],
+            invert=it.get("invert", False),
+        )
+        for it in items
+    ]
 
 
 def parse_pairs(spec: str) -> list[Pair]:

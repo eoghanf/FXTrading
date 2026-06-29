@@ -1,0 +1,34 @@
+# FX pairs to collect from IBKR and display in the viewer.
+#
+# Each pair becomes a CASH contract on IBKR's IDEALPRO exchange:
+#   Forex(base + quote)  e.g. Forex("EURUSD")
+#
+# Fields:
+#   name    display name (also the SQLite key)
+#   base    contract base currency (left side of the pair)
+#   quote   contract quote currency (right side)
+#   invert  optional (default false): if true, displayed price = 1 / contract mid
+#
+# Each pair needs market-data permission on your IBKR account, otherwise
+# reqMktData returns no ticks for that pair. Metals (XAU/XAG) are quoted as
+# FX CASH contracts on IDEALPRO and often covered by the same FX subscription.
+
+pairs:
+  # Majors
+  - name: "EUR/USD"
+    base: "EUR"
+    quote: "USD"
+  - name: "GBP/USD"
+    base: "GBP"
+    quote: "USD"
+  - name: "USD/JPY"
+    base: "USD"
+    quote: "JPY"
+  - name: "USD/CAD"
+    base: "USD"
+    quote: "CAD"
+
+  # Emerging / Asia
+  - name: "USD/TRY"
+    base: "USD"
+    quote: "TRY"

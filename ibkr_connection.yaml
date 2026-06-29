@@ -1,0 +1,9 @@
+# IB Gateway / TWS connection settings.
+#
+# Edit this file to point ingest.py at your gateway. CLI flags
+# (--port, --host, --client-id) still override these values.
+
+host: "127.0.0.1"
+port: 4002          # IB Gateway paper: 4002, live: 4001
+                    # TWS paper: 7497, live: 7496
+client_id: 1

@@ -43,7 +43,7 @@ import pyqtgraph as pg
 from pyqtgraph import DateAxisItem
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from pairs import DEFAULT_PAIRS, Pair, parse_pairs
+from pairs import Pair, load_pairs, parse_pairs
 from sim import run_sim
 from store import Store, reset_db
 
@@ -544,7 +544,7 @@ def main() -> None:
     ap.add_argument("--refresh-ms", type=int, default=100,
                     help="GUI refresh interval in ms (default 100)")
     ap.add_argument("--pairs", default=None,
-                    help="comma list BASE/QUOTE (default: EUR/USD,GBP/USD,USD/TRY,USD/CAD)")
+                    help="comma list BASE/QUOTE (default: read from fx_pairs.yaml)")
     ap.add_argument("--simulate", action="store_true",
                     help="launch the sim (populates fxsim.db) AND view it in one process")
     ap.add_argument("--reset", action="store_true",
@@ -564,7 +564,7 @@ def main() -> None:
     if args.reset:
         removed = reset_db(args.db)
         print(f"[fx] reset {args.db}: {'wiped' if removed else 'already empty'}")
-    pairs = parse_pairs(args.pairs) if args.pairs else DEFAULT_PAIRS
+    pairs = parse_pairs(args.pairs) if args.pairs else load_pairs()
 
     # Reader connection (the GUI polls this every refresh interval).
     source = DbSource(args.db, pairs, args.bar_seconds, args.window)
@@ -629,7 +629,10 @@ def main() -> None:
         labels[name] = lbl
 
     status_lbl = pg.LabelItem(justify="left", size="9pt", color="#9aa0aa")
-    win.addItem(status_lbl, row=2, col=0, colspan=2)
+    # Pairs are placed in a 2-column grid (row = i//2); the status label goes
+    # in the first free row below them, so it never collides with a plot.
+    status_row = (len(pairs) + 1) // 2
+    win.addItem(status_lbl, row=status_row, col=0, colspan=2)
     mode = "sim" if args.simulate else "live"
     status_lbl.setText(f"{mode}: {args.db}  starting...")
 
